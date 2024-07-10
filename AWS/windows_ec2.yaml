@@ -1,0 +1,186 @@
+---
+# This playbook creates a new EC2 instance from a Suncor AMI and configures it post-build
+
+- name: Create and configure new EC2 Instance
+  hosts: localhost
+  gather_facts: false
+  vars:
+    aws_secret_name: "WindowsDefaultPassword"
+
+  pre_tasks:
+    - name: Import AWS Common Vars based on ACCOUNT and LOCATION
+      ansible.builtin.include_role:
+        name: aws/aws_common_vars
+
+    - name: Authenticate to AWS
+      ansible.builtin.include_role:
+        name: aws/aws_authenticate_az_spn
+
+    - name: Fetch Windows password from AWS Secrets Manager
+      amazon.aws.aws_secret:
+        name: "{{ aws_secret_name }}"
+      register: secret_result
+
+    - name: Set Windows password fact
+      set_fact:
+        windows_password: "{{ secret_result.secret.password }}"
+
+  tasks:
+    - name: Launch an EC2 instance
+      amazon.aws.ec2_instance:
+        aws_access_key: "{{ aws_keys.access_key }}"
+        aws_secret_key: "{{ aws_keys.secret_key }}"
+        session_token: "{{ aws_keys.session_token }}"
+        name: "{{ INSTANCE_NAME }}"
+        region: "{{ LOCATION }}"
+        instance_type: "{{ VM_SHAPE_SURVEY }}"
+        vpc_subnet_id: "{{ SUBNET_ID }}"
+        security_group: default
+        image_id: "{{ IMAGE_ID }}"
+        network:
+          assign_public_ip: false  # Ensure no public IP is assigned
+          delete_on_termination: true
+        volumes:
+          # - device_name: /dev/sda1
+          #   ebs:
+          #     volume_size: "{{ ROOT_VOLUME_SIZE }}"
+          #     delete_on_termination: true
+          #     kms_key_id: "{{ kms_customer_key }}"
+          #     encrypted: true
+        user_data: |
+          <powershell>
+          net user /add Administrator "{{ windows_password }}"
+          net localgroup administrators Administrator /add
+          </powershell>
+        tags:
+          Env: "{{ Env }}"
+          BillingIndicator: "{{ tag_BillingIndicator }}"
+          APMID: "{{ tag_APMID }}"
+          ApplicationName: "{{ tag_ApplicationName }}"
+          SupportStatus: "{{ tag_SupportStatus }}"
+          DataSensitivity: "{{ tag_DataSensitivity }}"
+          Compliance: "{{ tag_Compliance }}"
+          BuiltRITM: "{{ BuildRITM_SURVEY }}"
+        state: started
+      register: ec2_instance_result
+
+    - name: Grab the instance private IP
+      amazon.aws.ec2_instance_info:
+        instance_ids: "{{ ec2_instance_result.instance_ids }}"
+      register: ec2_instance_info
+
+    - name: Set the instance private IP fact
+      set_fact:
+        instance_ip: "{{ ec2_instance_info.instances[0].private_ip_address }}"
+
+    - name: Debug the private IP
+      ansible.builtin.debug:
+        msg: "{{ instance_ip }}"
+
+    - name: Add newly built host to inventory
+      ansible.builtin.add_host:
+        name: "{{ instance_ip }}"
+        groups: windows_ec2
+        ansible_user: Administrator
+        ansible_password: "{{ windows_password }}"
+        ansible_connection: winrm
+        ansible_winrm_server_cert_validation: ignore
+        ansible_winrm_transport: ntlm
+        ansible_port: 5985
+
+- name: Run Windows server post build tasks
+  hosts: windows_ec2
+  gather_facts: false
+  tags:
+    - postbuild
+    - always
+
+  vars:
+    ansible_winrm_operation_timeout_sec: 120
+    ansible_winrm_read_timeout_sec: 240
+
+  pre_tasks:
+    - name: Wait for WinRm connection to settle
+      ansible.builtin.wait_for_connection:
+        delay: 120
+        timeout: 300
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+  tasks:
+    - name: Install Fleet Osquery
+      win_chocolatey:
+        name: fleet
+        state: present
+      tags: install_fleetosquery
+
+    - name: Install Qualys
+      win_chocolatey:
+        name: qualys
+        state: present
+      tags: install_qualys
+
+    - name: Install Tanium
+      win_chocolatey:
+        name: tanium
+        state: present
+      tags: install_tanium
+
+    - name: Install Winlogbeat
+      win_chocolatey:
+        name: winlogbeat
+        state: present
+      tags: install_winlogbeat
+
+    - name: Install RedPill
+      win_chocolatey:
+        name: redpill
+        state: present
+      tags: install_redpill
+
+    - name: Configure Windows MMA
+      win_feature:
+        name: Web-Mgmt-Tools
+        state: present
+      tags: config_win_mma
+
+    - name: Configure Local Admin Name
+      win_user:
+        name: new_admin
+        password: "{{ ansible_password }}"
+        state: present
+        groups:
+          - Administrators
+      tags: config_local_admin_name
+
+    - name: Configure Patch Group Membership
+      win_group_membership:
+        name: "PatchGroup"
+        members:
+          - "new_admin"
+      tags: config_patch_group_membership
+
+- name: Send email to user
+  hosts: localhost
+  tags:
+    - always
+    - report
+
+  tasks:
+    - name: Send Server Build complete Email
+      ansible.builtin.include_role:
+        name: utility/email_user
+      vars:
+        email_user_to:
+          - "{{ EMAIL }}"
+        email_user_subject: "{{ INSTANCE_NAME }} - Build Complete"
+        email_user_body: |
+          Hi,
+
+          The new virtual machine named {{ INSTANCE_NAME }} has been built successfully.
+
+          Thank you,
+            CloudOps
+      run_once: true
+      when: EMAIL is defined and EMAIL != ''
